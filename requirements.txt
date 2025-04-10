@@ -1,3 +1,2 @@
-Flask[async]==2.3.3
+flask[async]
 python-telegram-bot==20.8
-gunicorn
