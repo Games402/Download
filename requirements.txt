@@ -1,2 +1,4 @@
-flask[async]
+Flask[async]
 python-telegram-bot==20.8
+yt-dlp
+aiohttp
