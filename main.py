@@ -13,47 +13,53 @@ from telegram.ext import (
     filters,
 )
 
-# Load environment variables
+# Environment variables
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 WEBHOOK_PATH = f"/{TOKEN}"
 WEBHOOK_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/") + WEBHOOK_PATH
 
-# Initialize Flask
+# Flask and Telegram setup
 app = Flask(__name__)
 bot = Bot(token=TOKEN)
 application = Application.builder().token(TOKEN).build()
 
+
+# Flask route to verify service is running
 @app.route("/")
 def index():
-    return "✅ Bot is live!"
+    return "✅ Bot is running on Render"
 
+
+# Route to receive webhook updates from Telegram
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     application.update_queue.put_nowait(update)
     return "ok"
 
+
 # /start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send a .m3u8 link and I'll download it!")
+    await update.message.reply_text("👋 Send a .m3u8 link and I’ll download it!")
 
-# Handle .m3u8 link
+
+# Handle .m3u8 URL messages
 async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     if not url.endswith(".m3u8"):
-        await update.message.reply_text("❌ Please send a valid .m3u8 URL.")
+        await update.message.reply_text("❌ Please send a valid .m3u8 link.")
         return
 
     filename = f"{uuid.uuid4()}.mp4"
-    progress_msg = await update.message.reply_text("📥 Downloading...")
+    status_msg = await update.message.reply_text("📥 Downloading...")
 
-    def progress_hook(d):
+    def hook(d):
         if d["status"] == "downloading":
-            percent = d.get("_percent_str", "")
+            percent = d.get("_percent_str", "").strip()
             eta = d.get("eta", "")
-            text = f"📥 Downloading: {percent} (ETA: {eta}s)"
+            msg = f"📥 {percent} (ETA: {eta}s)"
             try:
-                asyncio.run_coroutine_threadsafe(progress_msg.edit_text(text), context.application.loop)
+                asyncio.run_coroutine_threadsafe(status_msg.edit_text(msg), context.application.loop)
             except:
                 pass
 
@@ -61,41 +67,49 @@ async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "outtmpl": filename,
         "format": "best",
         "quiet": True,
-        "progress_hooks": [progress_hook],
+        "progress_hooks": [hook],
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
     except Exception as e:
-        await progress_msg.edit_text(f"❌ Download failed:\n{e}")
+        await status_msg.edit_text(f"❌ Download failed:\n{e}")
         return
 
-    await progress_msg.edit_text("☁️ Uploading to file.io...")
+    await status_msg.edit_text("☁️ Uploading to file.io...")
 
     try:
         with open(filename, "rb") as f:
-            r = requests.post("https://file.io", files={"file": f})
-        result = r.json()
+            res = requests.post("https://file.io", files={"file": f})
+        result = res.json()
         if result.get("success"):
-            await progress_msg.edit_text(f"✅ Done!\n🔗 [Download Link]({result['link']})", parse_mode="Markdown")
+            await status_msg.edit_text(f"✅ Done!\n🔗 [Download Link]({result['link']})", parse_mode="Markdown")
         else:
-            await progress_msg.edit_text("❌ Upload failed.")
+            await status_msg.edit_text("❌ Upload failed.")
     except Exception as e:
-        await progress_msg.edit_text(f"❌ Upload error: {e}")
+        await status_msg.edit_text(f"❌ Error uploading:\n{e}")
     finally:
         if os.path.exists(filename):
             os.remove(filename)
 
-# Add handlers
+
+# Set up handlers
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download))
 
-# Set webhook and start Flask app
-async def set_webhook():
+
+# ✅ Run Flask AND Application (this is the fix)
+async def main():
     await bot.set_webhook(WEBHOOK_URL)
-    print("✅ Webhook set at:", WEBHOOK_URL)
+    print(f"✅ Webhook set to {WEBHOOK_URL}")
+
+    # Start Application in background so it processes updates
+    asyncio.create_task(application.initialize())
+    asyncio.create_task(application.start())
+
+    # Run Flask server
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
 if __name__ == "__main__":
-    asyncio.run(set_webhook())
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    asyncio.run(main())
