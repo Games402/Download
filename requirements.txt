@@ -1,2 +1,4 @@
-Flask[async]
-python-telegram-bot==20.8
+flask[async]
+python-telegram-bot==20.7
+yt-dlp
+requests
