@@ -1,113 +1,82 @@
 import os
 import yt_dlp
-import uuid
-import asyncio
 import requests
+import uuid
 from flask import Flask, request
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# Env variables
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-WEBHOOK_PATH = f"/{TOKEN}"
-WEBHOOK_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/") + WEBHOOK_PATH
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL") + f"/{TOKEN}"
+bot = Bot(token=TOKEN)
 
-# Flask app
 app = Flask(__name__)
-
-# Telegram Application
 application = Application.builder().token(TOKEN).build()
 
-@app.route("/")
-def index():
-    return "✅ Bot is alive!"
-
-@app.route(WEBHOOK_PATH, methods=["POST"])
+@app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
+    update = Update.de_json(request.get_json(force=True), bot)
     application.update_queue.put_nowait(update)
-    return "ok"
+    return "OK", 200
 
-
-# --- Handlers ---
+@app.route("/", methods=["GET"])
+def index():
+    return "Bot is alive!", 200
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="👋 Send me a .m3u8 video link!")
+    await update.message.reply_text("👋 Send me a .m3u8 link and I’ll download and process the video for you!")
 
-
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     if not url.endswith(".m3u8"):
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Please send a valid .m3u8 URL.")
+        await update.message.reply_text("❌ Please send a valid .m3u8 link.")
         return
 
-    msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="📥 Downloading your video...")
+    await update.message.reply_text("📥 Downloading video... Please wait.")
 
     filename = f"{uuid.uuid4()}.mp4"
-
-    def progress_hook(d):
-        if d["status"] == "downloading":
-            percent = d.get("_percent_str", "").strip()
-            eta = d.get("eta", "")
-            text = f"📥 {percent} (ETA: {eta}s)"
-            try:
-                asyncio.run_coroutine_threadsafe(msg.edit_text(text), application.bot.loop)
-            except:
-                pass
-
     ydl_opts = {
-        "outtmpl": filename,
-        "format": "best",
-        "quiet": True,
-        "progress_hooks": [progress_hook],
+        'outtmpl': filename,
+        'format': 'best',
+        'quiet': True,
+        'no_warnings': True,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
     except Exception as e:
-        await msg.edit_text(f"❌ Download failed:\n{e}")
+        await update.message.reply_text(f"❌ Download failed.\n{e}")
         return
 
-    await msg.edit_text("☁️ Uploading to file.io...")
+    size_mb = os.path.getsize(filename) / (1024 * 1024)
 
-    try:
+    if size_mb < 48:
+        await update.message.reply_video(video=open(filename, "rb"), caption="✅ Here's your video!")
+    else:
+        await update.message.reply_text("🔄 Uploading large file to file.io...")
         with open(filename, "rb") as f:
-            res = requests.post("https://file.io", files={"file": f})
-        result = res.json()
+            r = requests.post("https://file.io", files={"file": f})
+        result = r.json()
         if result.get("success"):
-            await msg.edit_text(f"✅ Done!\n🔗 [Download link]({result['link']})", parse_mode="Markdown")
+            await update.message.reply_text(f"✅ Video uploaded!\n🔗 {result['link']}")
         else:
-            await msg.edit_text("❌ Upload failed.")
-    except Exception as e:
-        await msg.edit_text(f"❌ Upload error:\n{e}")
-    finally:
-        if os.path.exists(filename):
-            os.remove(filename)
+            await update.message.reply_text("❌ Upload to file.io failed.")
 
+    os.remove(filename)
 
 # Register handlers
 application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-
-
-# --- Run everything ---
-async def main():
-    await application.bot.set_webhook(WEBHOOK_URL)
-    print(f"✅ Webhook set to {WEBHOOK_URL}")
-
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()  # just in case, redundant safety
-
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download))
 
 if __name__ == "__main__":
+    import asyncio
+
+    async def main():
+        await bot.set_webhook(WEBHOOK_URL)
+        await application.initialize()
+        await application.start()
+        print("✅ Bot is running on webhook...")
+
     asyncio.run(main())
+    app.run(host="0.0.0.0", port=10000)
