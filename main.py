@@ -1,41 +1,71 @@
-import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import os
 import yt_dlp
+import requests
+import asyncio
+import uuid
+from telegram import Update, InputFile
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 TOKEN = "7881285994:AAGB5cPLZ61CuyZqvmzoee7cv-YeHTeX5xM"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎯 Send me a .m3u8 URL and I'll check if it's valid.")
+    await update.message.reply_text("👋 Send me a `.m3u8` video link, and I'll fetch it, upload it to File.io, and send you the download link!")
 
-async def check_m3u8(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-
     if not url.endswith(".m3u8"):
-        await update.message.reply_text("❌ That doesn't look like a valid .m3u8 link.")
+        await update.message.reply_text("❌ Please send a valid `.m3u8` link.")
         return
 
-    await update.message.reply_text("🔍 Checking the link...")
+    temp_filename = f"/tmp/{uuid.uuid4()}.mp4"
+    progress_msg = await update.message.reply_text("📥 Starting download...")
+
+    def progress_hook(d):
+        if d['status'] == 'downloading':
+            percent = d.get('_percent_str', '').strip()
+            eta = d.get('eta', '...')
+            asyncio.run_coroutine_threadsafe(
+                progress_msg.edit_text(f"📥 Downloading... {percent} (ETA: {eta}s)"),
+                context.application.loop
+            )
 
     ydl_opts = {
+        'outtmpl': temp_filename,
+        'format': 'best',
+        'progress_hooks': [progress_hook],
         'quiet': True,
         'no_warnings': True,
-        'simulate': True,  # Do not download, just probe
-        'force_generic_extractor': False,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        await update.message.reply_text(f"✅ Link is valid!\nTitle: {info.get('title', 'N/A')}")
+            ydl.download([url])
     except Exception as e:
-        await update.message.reply_text(f"❌ Invalid or inaccessible URL.\nError: {e}")
+        await progress_msg.edit_text(f"❌ Failed to download.\nError: `{e}`", parse_mode="Markdown")
+        return
+
+    await progress_msg.edit_text("✅ Downloaded! Uploading to file.io...")
+
+    try:
+        with open(temp_filename, 'rb') as f:
+            response = requests.post('https://file.io', files={'file': f})
+        result = response.json()
+        if result.get("success"):
+            link = result['link']
+            await progress_msg.edit_text(f"✅ Upload complete!\n📎 [Click here to download]({link})", parse_mode="Markdown")
+        else:
+            await progress_msg.edit_text("❌ Upload failed.")
+    except Exception as e:
+        await progress_msg.edit_text(f"❌ Upload error: {e}")
+    finally:
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
 
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_m3u8))
-    print("✅ Bot is running...")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
+    print("✅ Bot running...")
     app.run_polling()
 
 if __name__ == "__main__":
