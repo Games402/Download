@@ -5,103 +5,88 @@ import uuid
 import asyncio
 from flask import Flask, request
 from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Dispatcher
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")  # e.g., https://your-app.onrender.com
-PORT = int(os.environ.get('PORT', 5000))
+# Config from environment
+TOKEN = os.environ["TELEGRAM_TOKEN"]
+WEBHOOK_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip('/') + f"/{TOKEN}"
 
 bot = Bot(token=TOKEN)
 app = Flask(__name__)
 application = Application.builder().token(TOKEN).build()
 
-# Start command
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send me a `.m3u8` link to download and upload the video for you.")
+@app.route("/")
+def index():
+    return "✅ Bot is alive!"
 
-# Download and upload logic
-async def handle_m3u8(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), bot)
+        application.update_queue.put_nowait(update)
+        return "ok"
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Send me a .m3u8 URL and I’ll fetch it for you!")
+
+async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     if not url.endswith(".m3u8"):
-        await update.message.reply_text("❌ Please send a valid `.m3u8` link.")
+        await update.message.reply_text("❌ Please send a valid .m3u8 link.")
         return
 
-    video_filename = f"{uuid.uuid4()}.mp4"
-    progress = await update.message.reply_text("📥 Starting download...")
+    filename = f"{uuid.uuid4()}.mp4"
+    progress_msg = await update.message.reply_text("📥 Starting download...")
 
-    def hook(d):
-        if d['status'] == 'downloading':
-            percent = d.get('_percent_str', '').strip()
-            eta = d.get('eta', '...')
+    def progress_hook(d):
+        if d["status"] == "downloading":
+            percent = d.get("_percent_str", "...")
+            eta = d.get("eta", "...")
             asyncio.run_coroutine_threadsafe(
-                progress.edit_text(f"📥 Downloading... {percent} (ETA: {eta}s)"),
+                progress_msg.edit_text(f"📥 Downloading... {percent} (ETA: {eta}s)"),
                 context.application.loop
             )
 
     ydl_opts = {
-        'outtmpl': video_filename,
+        'outtmpl': filename,
         'format': 'best',
-        'progress_hooks': [hook],
+        'progress_hooks': [progress_hook],
         'quiet': True,
-        'no_warnings': True
+        'no_warnings': True,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
-        await progress.edit_text("✅ Download complete. Uploading to file.io...")
     except Exception as e:
-        await progress.edit_text(f"❌ Download failed.\nError: {e}")
+        await progress_msg.edit_text(f"❌ Download failed:\n`{e}`", parse_mode="Markdown")
         return
 
-    # Upload to file.io
+    await progress_msg.edit_text("✅ Uploading to file.io...")
+
     try:
-        with open(video_filename, 'rb') as f:
-            response = requests.post('https://file.io', files={'file': f})
-        result = response.json()
-
+        with open(filename, "rb") as f:
+            r = requests.post("https://file.io", files={"file": f})
+        result = r.json()
         if result.get("success"):
-            await progress.edit_text(f"✅ Uploaded to File.io:\n🔗 {result['link']}")
+            await progress_msg.edit_text(f"✅ Done!\n📎 [Download link]({result['link']})", parse_mode="Markdown")
         else:
-            await progress.edit_text(f"❌ Upload failed: {result.get('message')}")
-
-        # If file < 49MB, also send to user directly
-        if os.path.getsize(video_filename) < 49 * 1024 * 1024:
-            await update.message.reply_video(video=open(video_filename, 'rb'))
-        else:
-            await update.message.reply_text("⚠️ File is too large to send via Telegram (limit ~49MB for bots).")
-
+            await progress_msg.edit_text("❌ Upload failed.")
     except Exception as e:
-        await progress.edit_text(f"❌ Upload failed.\nError: {e}")
+        await progress_msg.edit_text(f"❌ Upload error: `{e}`", parse_mode="Markdown")
     finally:
-        if os.path.exists(video_filename):
-            os.remove(video_filename)
+        if os.path.exists(filename):
+            os.remove(filename)
 
-# Handlers
+# Register handlers
 application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_m3u8))
-
-# Flask route for webhook
-@app.route(f'/{TOKEN}', methods=["POST"])
-def telegram_webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    application.update_queue.put_nowait(update)
-    return "ok"
-
-@app.route("/", methods=["GET"])
-def index():
-    return "Bot is running!"
-
-# Set webhook on startup
-async def set_webhook():
-    await bot.set_webhook(f"{RENDER_URL}/{TOKEN}")
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
 
 if __name__ == "__main__":
-    import threading
+    async def setup():
+        await bot.set_webhook(WEBHOOK_URL)
+        print("✅ Webhook set:", WEBHOOK_URL)
 
-    # Run Flask in separate thread
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT)).start()
-
-    # Set webhook and run application
-    application.run_task(set_webhook())
-    
+    application.run_task(setup())
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
