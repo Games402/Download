@@ -1,4 +1,4 @@
+Flask==2.3.3
 python-telegram-bot==20.7
-flask
 yt-dlp
 requests
