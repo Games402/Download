@@ -1,138 +1,175 @@
 import os
 import json
-import asyncio
 import shutil
 import psutil
-import subprocess
-from uuid import uuid4
+import asyncio
+import threading
+from datetime import datetime
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, ContextTypes
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ==== CONFIG ====
+from yt_dlp import YoutubeDL
+
+app = Flask(__name__)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_PATH = f"/{TOKEN}"
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL") + WEBHOOK_PATH
-DOWNLOAD_DIR = "/tmp/videos"
-COMPLETED_JSON = "completed.json"
-MAX_COMPLETED = 20
 
-# ==== INIT ====
-app = Flask(__name__)
 application = Application.builder().token(TOKEN).build()
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-if not os.path.exists(COMPLETED_JSON):
-    with open(COMPLETED_JSON, "w") as f:
-        json.dump([], f)
 
-pending_downloads = {}
-download_logs = []
+queue_lock = threading.Lock()
+task_queue = []
+is_downloading = False
+logs = []
+completed_files = []
 
-# ==== HANDLERS ====
+COMPLETED_LOG = "completed.json"
+
+def save_completed():
+    with open(COMPLETED_LOG, "w") as f:
+        json.dump(completed_files[-20:], f)
+
+def load_completed():
+    global completed_files
+    if os.path.exists(COMPLETED_LOG):
+        with open(COMPLETED_LOG) as f:
+            completed_files = json.load(f)
+
+load_completed()
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send a `.m3u8` video link to start downloading.")
+    await update.message.reply_text("I'm alive! Send a .m3u8 URL to download.")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text = update.message.text.strip()
-
-    if text.startswith("http") and ".m3u8" in text:
-        pending_downloads[chat_id] = {"url": text}
-        await update.message.reply_text(
-            "📥 Please send a filename (optional) or click cancel.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
-        )
-    elif chat_id in pending_downloads:
-        task = pending_downloads.pop(chat_id)
-        await download_video(task["url"], chat_id, context, text)
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if update.callback_query.data == "cancel":
-        pending_downloads.pop(chat_id, None)
-        await update.callback_query.message.reply_text("❌ Cancelled.")
-
-# ==== DOWNLOAD ====
-async def download_video(url, chat_id, context, file_name=None):
-    uid = str(uuid4())[:8]
-    base_name = file_name or uid
-    output_path = os.path.join(DOWNLOAD_DIR, f"{base_name}.mp4")
-
-    await context.bot.send_message(chat_id, f"📡 Starting download for:\n{url}")
-
-    process = await asyncio.create_subprocess_exec(
-        "yt-dlp", "--no-playlist", "-f", "best", "-o", output_path, url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT
-    )
-
-    while True:
-        line = await process.stdout.readline()
-        if not line:
-            break
-        line = line.decode().strip()
-        if line:
-            await context.bot.send_message(chat_id, f"⏳ {line[:4000]}")
-
-    await process.wait()
-
-    if os.path.exists(output_path):
-        size = round(os.path.getsize(output_path) / (1024 * 1024), 2)
-        curl_output = subprocess.check_output(["curl", "-F", f"file=@{output_path}", "https://file.io"])
-        file_io_link = json.loads(curl_output.decode()).get("link")
-
-        await context.bot.send_message(
-            chat_id,
-            f"✅ Done!\n📦 File: {base_name}.mp4\n📁 Size: {size} MB\n🔗 {file_io_link}"
-        )
-
-        # Save in history
-        with open(COMPLETED_JSON) as f:
-            history = json.load(f)
-        history.insert(0, {"name": base_name, "size": f"{size}MB", "link": file_io_link})
-        with open(COMPLETED_JSON, "w") as f:
-            json.dump(history[:MAX_COMPLETED], f)
-
-        os.remove(output_path)
-    else:
-        await context.bot.send_message(chat_id, "❌ Download failed.")
-
-# ==== FLASK ROUTES ====
 @app.route("/", methods=["GET"])
 def home():
-    return "✅ Bot is Live"
+    return "Bot is Live ✅"
 
 @app.route(WEBHOOK_PATH, methods=["POST"])
 async def telegram_webhook():
     await application.initialize()
-    await application.process_update(Update.de_json(request.get_json(force=True), application.bot))
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    await application.process_update(update)
     return "OK"
 
 @app.route("/admin", methods=["GET"])
-def admin_status():
+def admin_info():
     ram = psutil.virtual_memory()
     disk = shutil.disk_usage("/")
-    with open(COMPLETED_JSON) as f:
-        completed = json.load(f)
     return jsonify({
-        "ram_used_mb": ram.used // (1024 * 1024),
-        "disk_used_mb": disk.used // (1024 * 1024),
-        "disk_free_mb": disk.free // (1024 * 1024),
-        "active_downloads": list(pending_downloads.keys()),
-        "completed_uploads": completed,
-        "logs": download_logs[-30:]
+        "status": "running",
+        "cpu_percent": psutil.cpu_percent(),
+        "ram_used": ram.used // (1024 ** 2),
+        "ram_total": ram.total // (1024 ** 2),
+        "disk_used": disk.used // (1024 ** 2),
+        "disk_total": disk.total // (1024 ** 2),
+        "active_tasks": 1 if is_downloading else 0,
+        "pending_tasks": len(task_queue),
+        "logs": logs[-10:],
+        "completed_files": completed_files[-20:]
     })
 
-# ==== RUN ====
+def append_log(message):
+    timestamp = datetime.now().strftime("[%H:%M:%S]")
+    logs.append(f"{timestamp} {message}")
+    if len(logs) > 50:
+        logs.pop(0)
+
+async def handle_download(url, chat_id, message_id):
+    global is_downloading
+
+    try:
+        append_log(f"Starting download for {url}")
+        await application.bot.edit_message_text("🔍 Processing URL...", chat_id, message_id)
+
+        filename = f"video_{datetime.now().strftime('%H%M%S')}.mp4"
+        output_path = f"./{filename}"
+
+        ydl_opts = {
+            'format': 'best',
+            'outtmpl': output_path,
+            'progress_hooks': [lambda d: asyncio.run_coroutine_threadsafe(
+                update_progress(d, chat_id, message_id), application.bot.loop)],
+        }
+
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get("title", "Video")
+            size_mb = round(info.get("filesize", 0) / (1024*1024), 2)
+            append_log(f"Title: {title} Size: {size_mb}MB")
+            await application.bot.edit_message_text(
+                f"📥 Downloading:\n<b>{title}</b>\nSize: {size_mb} MB\nStarted...",
+                chat_id,
+                message_id,
+                parse_mode="HTML"
+            )
+            ydl.download([url])
+
+        import requests
+        with open(output_path, "rb") as f:
+            response = requests.post("https://file.io", files={"file": f})
+            link = response.json().get("link", "Failed to upload.")
+
+        os.remove(output_path)
+
+        await application.bot.edit_message_text(
+            f"✅ Download complete!\n🔗 Link: {link}",
+            chat_id,
+            message_id
+        )
+        completed_files.append({
+            "title": title,
+            "size": f"{size_mb} MB",
+            "link": link,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+        save_completed()
+    except Exception as e:
+        append_log(f"Error: {e}")
+        await application.bot.edit_message_text(f"❌ Error: {e}", chat_id, message_id)
+    finally:
+        is_downloading = False
+        check_queue()
+
+async def update_progress(d, chat_id, message_id):
+    if d.get('status') == 'downloading':
+        percent = d.get("_percent_str", "").strip()
+        speed = d.get("_speed_str", "").strip()
+        eta = d.get("_eta_str", "").strip()
+        text = f"⬇️ Progress: {percent}\n⚡ Speed: {speed}\n⏱ ETA: {eta}"
+        try:
+            await application.bot.edit_message_text(text, chat_id, message_id)
+        except:
+            pass
+
+def check_queue():
+    global is_downloading
+    with queue_lock:
+        if not is_downloading and task_queue:
+            url, chat_id, msg_id = task_queue.pop(0)
+            is_downloading = True
+            asyncio.run_coroutine_threadsafe(
+                handle_download(url, chat_id, msg_id), application.bot.loop
+            )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.message.text:
+        url = update.message.text.strip()
+        if ".m3u8" in url:
+            chat_id = update.message.chat_id
+            processing_msg = await update.message.reply_text("🕒 Queued or Processing...")
+            with queue_lock:
+                if is_downloading:
+                    task_queue.append((url, chat_id, processing_msg.message_id))
+                    await context.bot.send_message(chat_id, f"⏳ System busy. Your task is queued.")
+                else:
+                    is_downloading = True
+                    asyncio.create_task(handle_download(url, chat_id, processing_msg.message_id))
+
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
 if __name__ == "__main__":
     import asyncio
     asyncio.run(application.bot.set_webhook(url=WEBHOOK_URL))
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-
     app.run(host="0.0.0.0", port=10000)
