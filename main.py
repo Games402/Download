@@ -1,85 +1,55 @@
 import os
-import asyncio
 import logging
 from flask import Flask, request
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import subprocess
-import requests
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL")
-
+# Logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Bot Token and Render URL
+TOKEN = os.environ['TELEGRAM_TOKEN']
+WEBHOOK_URL = os.environ['RENDER_EXTERNAL_URL'] + '/' + TOKEN
+
+# Flask app (with async enabled)
 app = Flask(__name__)
-bot = Bot(TOKEN)
 
-# Telegram handlers
+# Telegram app
+telegram_app = Application.builder().token(TOKEN).build()
+
+# Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Welcome! Send me an .m3u8 video URL to download.")
+    await update.message.reply_text("✅ Bot is alive and running!")
 
+# Status command
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot is alive and working!")
+    await update.message.reply_text("✅ Status: Running fine on Render!")
 
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if not url.endswith(".m3u8"):
-        await update.message.reply_text("❌ Please send a valid .m3u8 URL.")
-        return
+# Add handlers
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CommandHandler("status", status))
 
-    msg = await update.message.reply_text("⏬ Download started... please wait.")
-
-    filename = "video.mp4"
+# Flask route for webhook
+@app.post(f"/{TOKEN}")
+async def webhook() -> str:
     try:
-        command = [
-            "yt-dlp", url,
-            "-o", filename,
-            "--no-part"
-        ]
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-        if os.path.exists(filename):
-            await msg.edit_text("✅ Download complete. Uploading to file.io...")
-
-            with open(filename, "rb") as f:
-                upload = requests.post("https://file.io", files={"file": f})
-            upload_url = upload.json().get("link", "Upload failed")
-
-            await update.message.reply_text(f"📁 File.io link: {upload_url}")
-
-            # If file is small enough (<50MB), send via Telegram
-            if os.path.getsize(filename) < 50 * 1024 * 1024:
-                await update.message.reply_document(document=open(filename, "rb"))
-
-            os.remove(filename)
-        else:
-            await msg.edit_text("❌ Download failed.")
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        await telegram_app.process_update(update)
     except Exception as e:
-        await msg.edit_text(f"⚠️ Error: {str(e)}")
-
-
-application = Application.builder().token(TOKEN).build()
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("status", status))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-
-@app.route(f"/{TOKEN}", methods=["POST"])
-async def webhook():
-    data = request.get_json(force=True)
-    update = Update.de_json(data, bot)
-    await application.process_update(update)
+        logger.error(f"Error handling update: {e}")
     return "ok"
 
-@app.route("/", methods=["GET"])
+# Optional root for testing
+@app.get("/")
 def root():
-    return "Bot is running."
+    return "Bot is running!"
 
+# Set webhook on start
 async def set_webhook():
-    await bot.delete_webhook()
-    await bot.set_webhook(url=f"{BASE_URL}/{TOKEN}")
+    await telegram_app.bot.set_webhook(WEBHOOK_URL)
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(set_webhook())
-    app.run(host="0.0.0.0", port=10000)
+    import asyncio
+    asyncio.run(set_webhook())
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
