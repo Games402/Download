@@ -1,82 +1,55 @@
 import os
-import yt_dlp
-import requests
-import uuid
+import logging
 from flask import Flask, request
-from telegram import Bot, Update
+from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL") + f"/{TOKEN}"
-bot = Bot(token=TOKEN)
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")  # like https://download-pw.onrender.com
+WEBHOOK_PATH = f"/{TOKEN}"
 
+bot = Bot(token=TOKEN)
 app = Flask(__name__)
 application = Application.builder().token(TOKEN).build()
 
-@app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    application.update_queue.put_nowait(update)
-    return "OK", 200
+logging.basicConfig(level=logging.INFO)
 
+
+# Handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Send me a .m3u8 URL and I’ll process it for you!")
+
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"You said: {update.message.text}")
+
+
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+
+# Webhook endpoint for Telegram
+@app.route(WEBHOOK_PATH, methods=["POST"])
+async def webhook() -> str:
+    update = Update.de_json(request.get_json(force=True), bot)
+    await application.process_update(update)
+    return "OK"
+
+
+# Health check
 @app.route("/", methods=["GET"])
 def index():
-    return "Bot is alive!", 200
+    return "Bot is live!"
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send me a .m3u8 link and I’ll download and process the video for you!")
 
-async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if not url.endswith(".m3u8"):
-        await update.message.reply_text("❌ Please send a valid .m3u8 link.")
-        return
-
-    await update.message.reply_text("📥 Downloading video... Please wait.")
-
-    filename = f"{uuid.uuid4()}.mp4"
-    ydl_opts = {
-        'outtmpl': filename,
-        'format': 'best',
-        'quiet': True,
-        'no_warnings': True,
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-    except Exception as e:
-        await update.message.reply_text(f"❌ Download failed.\n{e}")
-        return
-
-    size_mb = os.path.getsize(filename) / (1024 * 1024)
-
-    if size_mb < 48:
-        await update.message.reply_video(video=open(filename, "rb"), caption="✅ Here's your video!")
-    else:
-        await update.message.reply_text("🔄 Uploading large file to file.io...")
-        with open(filename, "rb") as f:
-            r = requests.post("https://file.io", files={"file": f})
-        result = r.json()
-        if result.get("success"):
-            await update.message.reply_text(f"✅ Video uploaded!\n🔗 {result['link']}")
-        else:
-            await update.message.reply_text("❌ Upload to file.io failed.")
-
-    os.remove(filename)
-
-# Register handlers
-application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download))
-
+# Start the bot and set webhook
 if __name__ == "__main__":
     import asyncio
 
     async def main():
-        await bot.set_webhook(WEBHOOK_URL)
-        await application.initialize()
-        await application.start()
-        print("✅ Bot is running on webhook...")
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_webhook(url=f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}")
+        print("✅ Webhook set successfully.")
 
     asyncio.run(main())
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
