@@ -1,39 +1,53 @@
 import os
 from flask import Flask, request
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import asyncio
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL") + f"/{TOKEN}"
+# Load environment variables
+BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL") + "/" + BOT_TOKEN
 
+# Create Flask app
 app = Flask(__name__)
+application = None  # We'll create the Telegram application later
 
-# --- Telegram handlers ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hey! Your bot is live and ready 🚀")
+    await update.message.reply_text("✅ Bot is live and webhook is working!")
 
-# --- Create Application ---
-application = Application.builder().token(TOKEN).build()
-application.add_handler(CommandHandler("start", start))
 
-# --- Flask route to receive webhook updates ---
-@app.route(f"/{TOKEN}", methods=["POST"])
-def telegram_webhook():
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📡 Webhook status: OK\n⚙️ Server running fine.")
+
+
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+async def webhook():
     if request.method == "POST":
         update = Update.de_json(request.get_json(force=True), application.bot)
-        application.update_queue.put_nowait(update)
-        return "ok", 200
+        await application.process_update(update)
+        return "ok"
 
-# --- Basic homepage route (optional) ---
+
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot is running 😎", 200
+    return "Bot is live."
 
-# --- Set webhook when server starts ---
-async def set_webhook():
-    await application.bot.set_webhook(WEBHOOK_URL)
+
+async def main():
+    global application
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status))
+
+    # Set webhook
+    await application.bot.delete_webhook()
+    await application.bot.set_webhook(url=WEBHOOK_URL)
+
+    print("🚀 Bot webhook set and ready!")
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(set_webhook())  # Set webhook
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    asyncio.run(main())
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
