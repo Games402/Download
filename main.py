@@ -11,149 +11,158 @@ import requests
 
 app = Flask(__name__)
 
-DOWNLOAD_DIR = "downloads"
-PART_SIZE_MB = 300
-MAX_CONCURRENT = 1
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
 tasks = {}
 task_queue = []
-active_downloads = 0
+max_concurrent_downloads = 1
+current_downloads = 0
+DOWNLOAD_DIR = "downloads"
+PART_SIZE_MB = 400  # split video if it's larger than 400MB
 
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-def format_eta(seconds):
-    m, s = divmod(int(seconds), 60)
-    return f"{m:02}:{s:02}"
+def format_size(bytes):
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if bytes < 1024:
+            return f"{bytes:.2f}{unit}"
+        bytes /= 1024
+    return f"{bytes:.2f}TB"
 
-def log_status(task_id, message, percent):
-    now = time.time()
-    tasks[task_id]["log"] = {
+def log_progress(task_id, message, percent):
+    tasks[task_id]["progress"] = {
         "message": message,
         "percent": percent,
-        "timestamp": now
+        "timestamp": time.strftime("%M:%S", time.localtime())
     }
 
-def handle_task(task):
-    global active_downloads
+def process_queue():
+    global current_downloads
+    while True:
+        if current_downloads < max_concurrent_downloads and task_queue:
+            task = task_queue.pop(0)
+            current_downloads += 1
+            threading.Thread(target=handle_download, args=(task,)).start()
+        time.sleep(1)
+
+def handle_download(task):
+    global current_downloads
     task_id = task["id"]
     url = task["url"]
-    start_time = time.time()
     tasks[task_id] = {
         "status": "processing",
         "start_time": time.strftime('%Y-%m-%d %H:%M:%S'),
-        "log": {},
-        "parts": []
+        "progress": {},
+        "result": []
+    }
+
+    log_progress(task_id, "🔍 Processing URL", 5)
+    start_time = time.time()
+    full_path = os.path.join(DOWNLOAD_DIR, f"{task_id}.mp4")
+
+    ydl_opts = {
+        "outtmpl": full_path,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 2,
+        "progress_hooks": [lambda d: hook(d, task_id, start_time)],
+        "ffmpeg_location": "/usr/bin/ffmpeg",
+        "hls_prefer_native": True,
+        "allow_unplayable_formats": True,
     }
 
     try:
-        log_status(task_id, "🔍 Processing URL...", 5)
-
-        # Step 1: Download .m3u8 as a full MP4
-        filename = os.path.join(DOWNLOAD_DIR, f"{task_id}.mp4")
-        ydl_opts = {
-            'format': 'best',
-            'quiet': True,
-            'outtmpl': filename,
-            'retries': 2,
-            'noplaylist': True,
-            'no_warnings': True,
-            'ffmpeg_location': '/usr/bin/ffmpeg',
-            'progress_hooks': [lambda d: update_hook(d, task_id, start_time)]
-        }
-
+        log_progress(task_id, "✅ Validating link...", 10)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
-        log_status(task_id, "🎬 Splitting video into parts...", 92)
-
-        # Step 2: Split into 300MB chunks
-        split_dir = os.path.join(DOWNLOAD_DIR, f"{task_id}_parts")
-        os.makedirs(split_dir, exist_ok=True)
-
-        part_prefix = os.path.join(split_dir, f"{task_id}_part_")
-        split_cmd = [
-            "ffmpeg", "-i", filename, "-c", "copy", "-f", "segment",
-            "-segment_size", str(PART_SIZE_MB * 1024 * 1024),
-            "-reset_timestamps", "1", f"{part_prefix}%03d.mp4"
-        ]
-
-        subprocess.run(split_cmd, check=True)
-        os.remove(filename)
-
-        # Step 3: Upload each part
-        for part_file in sorted(os.listdir(split_dir)):
-            part_path = os.path.join(split_dir, part_file)
-            log_status(task_id, f"📤 Uploading {part_file}...", 95)
-
-            with open(part_path, "rb") as f:
-                r = requests.post("https://store1.gofile.io/uploadFile", files={"file": f})
-                download_url = r.json()["data"]["downloadPage"]
-                tasks[task_id]["parts"].append(download_url)
-            os.remove(part_path)
-
+        log_progress(task_id, "📤 Splitting & uploading...", 95)
+        part_links = split_and_upload(task_id, full_path)
+        tasks[task_id]["result"] = part_links
+        log_progress(task_id, f"✅ Done in {int(time.time() - start_time)}s", 100)
         tasks[task_id]["status"] = "completed"
-        log_status(task_id, f"✅ Done! {len(tasks[task_id]['parts'])} parts uploaded.", 100)
 
     except Exception as e:
         tasks[task_id]["status"] = "error"
-        log_status(task_id, f"❌ Error: {str(e)}", 0)
+        log_progress(task_id, f"❌ Error: {str(e)}", 0)
+
     finally:
-        shutil.rmtree(split_dir, ignore_errors=True)
-        active_downloads -= 1
+        current_downloads -= 1
+        if os.path.exists(full_path):
+            os.remove(full_path)
 
+def split_and_upload(task_id, video_path):
+    part_urls = []
+    size_mb = os.path.getsize(video_path) / (1024 * 1024)
 
-def update_hook(d, task_id, start_time):
+    if size_mb <= PART_SIZE_MB:
+        part_urls.append(upload_to_gofile(video_path))
+        return part_urls
+
+    part_num = 1
+    temp_dir = os.path.join(DOWNLOAD_DIR, f"{task_id}_parts")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    command = f"ffmpeg -i \"{video_path}\" -c copy -map 0 -f segment -segment_time 300 -reset_timestamps 1 \"{temp_dir}/part_%03d.mp4\""
+    subprocess.call(command, shell=True)
+
+    for fname in sorted(os.listdir(temp_dir)):
+        fpath = os.path.join(temp_dir, fname)
+        part_links.append(upload_to_gofile(fpath))
+        os.remove(fpath)
+
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    return part_urls
+
+def upload_to_gofile(file_path):
+    with open(file_path, "rb") as f:
+        response = requests.post("https://store1.gofile.io/uploadFile", files={"file": f})
+    return response.json()["data"]["downloadPage"]
+
+def hook(d, task_id, start_time):
     if d["status"] == "downloading":
-        p = float(d.get("_percent_str", "0").strip("%"))
-        eta = format_eta(d.get("eta", 0))
-        log_status(task_id, f"⬇️ Downloading... {p:.1f}% | ETA {eta}", p)
+        percent = float(d.get("_percent_str", "0%").strip("%"))
+        downloaded = d.get("_downloaded_bytes_str", "0B")
+        total = d.get("_total_bytes_str", "0B")
+        speed = d.get("_speed_str", "0B/s")
+        eta = d.get("eta", 0)
+        msg = f"⬇️ {percent:.1f}% | {downloaded}/{total} at {speed} | ETA: {eta}s"
+        log_progress(task_id, msg, percent)
     elif d["status"] == "finished":
-        log_status(task_id, "📦 Download complete. Processing...", 90)
-
-
-def task_manager():
-    global active_downloads
-    while True:
-        if active_downloads < MAX_CONCURRENT and task_queue:
-            task = task_queue.pop(0)
-            active_downloads += 1
-            threading.Thread(target=handle_task, args=(task,)).start()
-        time.sleep(1)
-
+        log_progress(task_id, "🔄 Processing video...", 90)
 
 @app.route("/download")
-def queue_download():
+def download():
     url = request.args.get("url")
     if not url:
         return jsonify({"error": "Missing URL"}), 400
+
     task_id = str(uuid.uuid4())
     task = {"id": task_id, "url": url}
     task_queue.append(task)
-    return jsonify({"task_id": task_id, "status_url": f"/response?taskid={task_id}"}), 202
-
+    return jsonify({
+        "task_id": task_id,
+        "status_url": f"/response?taskid={task_id}"
+    }), 202
 
 @app.route("/response")
-def get_status():
+def response():
     task_id = request.args.get("taskid")
     if not task_id or task_id not in tasks:
         return jsonify({"error": "Invalid or missing task ID"}), 404
     return jsonify(tasks[task_id])
 
-
 @app.route("/")
-def health():
+def home():
     return jsonify({
         "status": "running",
-        "queued": len(task_queue),
-        "active": active_downloads,
         "tasks": len(tasks),
+        "queue": len(task_queue),
+        "active_downloads": current_downloads,
         "cpu": f"{psutil.cpu_percent()}%",
-        "ram": f"{psutil.virtual_memory().percent}%"
+        "memory": f"{psutil.virtual_memory().percent}%"
     })
 
-
-# Start background task manager
-threading.Thread(target=task_manager, daemon=True).start()
+threading.Thread(target=process_queue, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
