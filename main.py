@@ -1,102 +1,152 @@
 from flask import Flask, request, jsonify
-import threading, time, uuid, shutil
 from yt_dlp import YoutubeDL
-import os, json, datetime, subprocess
+import threading, time, uuid, shutil, json, os, datetime, subprocess
+import requests  # ✅ Required for GoFile and key fetching
 
 app = Flask(__name__)
-tasks = {}
-queue = []
-MAX_LOG = 20
-LOG_FILE = 'logs.json'
 
-def save_log(task_id, log):
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, 'r') as f:
-            logs = json.load(f)
-    else:
-        logs = {}
+MAX_LOGS = 20
+active_task = None
+task_queue = []
+progress_data = {}
+completed_logs_path = "completed_logs.json"
 
-    logs[task_id] = log
-    if len(logs) > MAX_LOG:
-        oldest = sorted(logs.keys())[0]
-        logs.pop(oldest)
+# Load existing logs if available
+if os.path.exists(completed_logs_path):
+    with open(completed_logs_path) as f:
+        completed_logs = json.load(f)
+else:
+    completed_logs = []
 
-    with open(LOG_FILE, 'w') as f:
-        json.dump(logs, f, indent=2)
+def save_completed_log(entry):
+    global completed_logs
+    completed_logs.insert(0, entry)
+    completed_logs = completed_logs[:MAX_LOGS]
+    with open(completed_logs_path, "w") as f:
+        json.dump(completed_logs, f, indent=2)
 
-def download_video(task_id, url):
-    log = {"status": "processing", "start_time": str(datetime.datetime.now()), "progress": []}
-    tasks[task_id] = log
-    save_log(task_id, log)
+def update_progress(taskid, message, percent, speed=None, eta=None):
+    timestamp = time.time()
+    log_entry = {
+        "message": message,
+        "percent": percent,
+        "timestamp": timestamp
+    }
+    if speed:
+        log_entry["speed"] = speed
+    if eta:
+        log_entry["eta"] = eta
 
-    def log_progress(msg, percent):
-        log["progress"].append({
-            "timestamp": time.time(),
-            "message": msg,
-            "percent": percent
-        })
-        save_log(task_id, log)
+    progress_data[taskid]["progress"].append(log_entry)
 
+def download_task(taskid, url):
     try:
-        log_progress("🔍 Processing URL", 5)
+        progress_data[taskid]["status"] = "processing"
+        update_progress(taskid, "🔍 Processing URL", 5)
+
         ydl_opts = {
+            'format': 'best',
+            'outtmpl': f'downloads/{taskid}.mp4',
             'quiet': True,
             'noplaylist': True,
-            'outtmpl': f'{task_id}.mp4',
-            'progress_hooks': [lambda d: log_progress(
-                f"⬇️ {d['_percent_str']} - ETA: {d.get('eta', '?')}s", int(float(d['_percent_str'].strip('%')))
-            ) if d['status'] == 'downloading' else None],
+            'progress_hooks': [lambda d: progress_hook(d, taskid)],
         }
 
-        if "#EXT-X-KEY" in requests.get(url).text:
-            ydl_opts['allow_unplayable_formats'] = True
-
-        log_progress("✅ Validating link", 15)
-        time.sleep(0.2)
+        update_progress(taskid, "🔎 Validating link", 10)
+        time.sleep(1)  # Simulated delay
 
         with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            info_dict = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info_dict)
+            video_title = info_dict.get("title", "Untitled")
+            filesize = info_dict.get("filesize") or 0
 
-        log_progress("☁️ Uploading to GoFile.io", 95)
-        gofile_resp = requests.post("https://store1.gofile.io/uploadFile", files={'file': open(f'{task_id}.mp4', 'rb')})
-        gofile_url = gofile_resp.json()['data']['downloadPage']
-        log_progress("✅ Completed", 100)
-        log['status'] = 'completed'
-        log['url'] = gofile_url
-        save_log(task_id, log)
-        os.remove(f'{task_id}.mp4')
+        update_progress(taskid, "✅ Uploading to GoFile", 95)
+
+        with open(filename, 'rb') as f:
+            res = requests.post("https://api.gofile.io/uploadFile", files={"file": f})
+            gofile_data = res.json()
+
+        gofile_url = gofile_data['data']['downloadPage']
+        update_progress(taskid, "✅ Done", 100)
+
+        save_completed_log({
+            "video_id": taskid,
+            "title": video_title,
+            "url": gofile_url,
+            "timestamp": str(datetime.datetime.now())
+        })
+
+        progress_data[taskid]["status"] = "done"
+        progress_data[taskid]["gofile"] = gofile_url
+
+        os.remove(filename)
+
     except Exception as e:
-        log['status'] = 'error'
-        log['error'] = str(e)
-        save_log(task_id, log)
+        update_progress(taskid, f"❌ Error: {str(e)}", 0)
+        progress_data[taskid]["status"] = "error"
+        progress_data[taskid]["error"] = str(e)
+
+    finally:
+        global active_task
+        active_task = None
+
+def progress_hook(d, taskid):
+    if d['status'] == 'downloading':
+        percent = d.get("_percent_str", "0").strip().replace("%", "")
+        speed = d.get("_speed_str", "0")
+        eta = d.get("_eta_str", "0")
+        update_progress(taskid, "⬇️ Downloading", float(percent), speed=speed, eta=eta)
 
 def task_handler():
-    if not queue or any(t["status"] == "processing" for t in tasks.values()):
-        return
-    task = queue.pop(0)
-    threading.Thread(target=download_video, args=(task["task_id"], task["url"])).start()
+    global active_task
+    if not active_task and task_queue:
+        next = task_queue.pop(0)
+        taskid = next["taskid"]
+        url = next["url"]
+        active_task = taskid
+        thread = threading.Thread(target=download_task, args=(taskid, url))
+        thread.start()
 
-@app.route('/download')
-def start_download():
-    url = request.args.get('url')
+@app.route('/download', methods=['GET'])
+def download():
+    url = request.args.get("url")
     if not url:
-        return jsonify({'error': 'URL is required'}), 400
-    task_id = str(uuid.uuid4())
-    tasks[task_id] = {"status": "queued", "progress": []}
-    queue.append({"task_id": task_id, "url": url})
-    task_handler()
-    return jsonify({"task_id": task_id, "message": "Task added to queue."})
+        return jsonify({"error": "Missing URL"}), 400
 
-@app.route('/response')
-def task_status():
-    task_id = request.args.get('taskid')
-    if task_id not in tasks:
-        return jsonify({'error': 'Invalid task ID'}), 404
-    return jsonify(tasks[task_id])
+    taskid = str(uuid.uuid4())
+    progress_data[taskid] = {
+        "status": "pending",
+        "start_time": str(datetime.datetime.now()),
+        "progress": []
+    }
 
-@app.route('/')
-def home():
-    return "🎬 .m3u8 Downloader API (Render Optimized)"
+    if active_task:
+        task_queue.append({"taskid": taskid, "url": url})
+        update_progress(taskid, "📦 Task queued. Awaiting execution.", 1)
+        return jsonify({"message": "Task added to queue", "taskid": taskid}), 202
+
+    thread = threading.Thread(target=download_task, args=(taskid, url))
+    active_task = taskid
+    thread.start()
+    return jsonify({"message": "Download started", "taskid": taskid}), 200
+
+@app.route('/response', methods=['GET'])
+def response():
+    taskid = request.args.get("taskid")
+    if not taskid or taskid not in progress_data:
+        return jsonify({"error": "Invalid or missing taskid"}), 404
+    return jsonify(progress_data[taskid])
+
+@app.route('/admin', methods=['GET'])
+def admin():
+    return jsonify({
+        "active_task": active_task,
+        "queue_length": len(task_queue),
+        "completed": completed_logs[-MAX_LOGS:]
+    })
 
 if __name__ == '__main__':
+    if not os.path.exists("downloads"):
+        os.makedirs("downloads")
     app.run(host='0.0.0.0', port=10000)
